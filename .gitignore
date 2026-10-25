@@ -1,0 +1,31 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & Credentials (CRITICAL: DO NOT COMMIT REAL KEYS)
+.env
+.env.local
+*.key
+*.pem
+
+# Data & Database
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
