@@ -145,5 +145,75 @@ class RiskEngine:
             circuit_reason=reason,
         )
 
+    def calculate_quick_churn_params(
+        self,
+        pair: str,
+        best_bid: Decimal,
+        best_ask: Decimal,
+        mid_price: Decimal,
+        held_base_qty: Decimal,
+    ) -> GridParameters:
+        """Calculate tight-maker parameters with asymmetric offloading for quick turnover."""
+        self.record_price(pair, mid_price)
+
+        # Check circuit breaker
+        circuit_broken, circuit_reason = self.check_circuit_breaker(
+            pair, best_bid, best_ask, mid_price
+        )
+        if circuit_broken:
+            return GridParameters(
+                allow_buy=False,
+                allow_sell=False,
+                buy_spread_pct=Decimal("0.0"),
+                sell_spread_pct=Decimal("0.0"),
+                buy_order_size_usd=self.base_order_size,
+                sell_order_size_usd=self.base_order_size,
+                circuit_broken=True,
+                circuit_reason=circuit_reason,
+            )
+
+        base_value_usd = held_base_qty * mid_price
+
+        # Asymmetric Aggressive Offloading:
+        # If we hold enough base coin (> 70% of standard order size), prioritize selling
+        # and pause buying so capital recycles cleanly back to USDT.
+        if base_value_usd >= self.base_order_size * Decimal("0.7"):
+            allow_buy = False
+            allow_sell = True
+            reason = f"Offloading Inventaris (${base_value_usd:.2f}) -> USDT"
+            sell_size = min(base_value_usd, self.base_order_size * Decimal("1.5"))
+            buy_size = Decimal("0.0")
+        elif base_value_usd >= Decimal("5.0"):
+            # Hold some base coin (above minimum $5 notional): allow two-sided quoting
+            allow_buy = True
+            allow_sell = True
+            reason = "Two-Sided Churning Aktif"
+            sell_size = base_value_usd
+            buy_size = self.base_order_size
+        else:
+            # Low or no base coin: buy to initiate new round-trip
+            allow_buy = True
+            allow_sell = False
+            reason = "Membuka Posisi Baru (Buy Best Bid)"
+            buy_size = self.base_order_size
+            sell_size = Decimal("0.0")
+
+        # Hard ceiling safety
+        if base_value_usd >= self.max_inventory_usd:
+            allow_buy = False
+            allow_sell = True
+            reason = f"Batas Inventaris Maksimal Tercapai (${base_value_usd:.2f})"
+
+        return GridParameters(
+            allow_buy=allow_buy,
+            allow_sell=allow_sell,
+            buy_spread_pct=Decimal("0.0"),  # 0 spread = peg exactly at best bid
+            sell_spread_pct=Decimal("0.0"), # 0 spread = peg exactly at best ask
+            buy_order_size_usd=buy_size,
+            sell_order_size_usd=sell_size,
+            circuit_broken=False,
+            circuit_reason=reason,
+        )
+
 
 risk_engine = RiskEngine()

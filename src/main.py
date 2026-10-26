@@ -84,8 +84,12 @@ class PolyesterBotOrchestrator:
         if not passed:
             return
 
-        # 2. Initialize Telemetry Database
+        # 2. Initialize Telemetry Database and sync trade history from exchange
         await telemetry.initialize()
+        client = await client_manager.get_client()
+        initial_synced = await telemetry.sync_from_exchange(client)
+        if initial_synced > 0:
+            console.print(f"[bold green][OK] Berhasil menyinkronkan {initial_synced} riwayat transaksi dari bursa Polyester[/bold green]")
 
         # 3. Spawn workers per trading pair
         for pair in config.trading_pairs:
@@ -98,6 +102,7 @@ class PolyesterBotOrchestrator:
         logger.info(f"Bot aktif dengan {len(self.workers)} pasangan trading: {list(self.workers.keys())}")
 
         # 4. Live Dashboard Loop
+        sync_counter = 0
         with Live(
             self.dashboard.generate_layout(await telemetry.get_metrics()),
             refresh_per_second=2,
@@ -105,6 +110,10 @@ class PolyesterBotOrchestrator:
         ) as live:
             while self.is_running:
                 try:
+                    sync_counter += 1
+                    # Periodically sync newly filled trades from exchange every 4 seconds
+                    if sync_counter % 4 == 0:
+                        await telemetry.sync_from_exchange(client)
                     metrics = await telemetry.get_metrics()
                     live.update(self.dashboard.generate_layout(metrics))
                     await asyncio.sleep(1.0)

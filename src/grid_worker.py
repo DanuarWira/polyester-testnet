@@ -70,10 +70,10 @@ class PairGridWorker:
             for b in bal_list:
                 asset_name = getattr(b, "asset", None) or asset_map.get(getattr(b, "asset_id", None))
                 if asset_name and asset_name.upper() == self.base_asset:
-                    # Parse trading bucket (scaled u128 with 18 decimals)
-                    if hasattr(b, "trading") and b.trading is not None:
-                        # Convert 18-decimal integer ticks to Decimal
-                        self.held_base_qty = Decimal(b.trading) / Decimal("1e18")
+                    # Use available (unlocked) trading balance to prevent Insufficient Funds
+                    avail_val = getattr(b, "available", getattr(b, "trading", "0"))
+                    if avail_val is not None:
+                        self.held_base_qty = Decimal(str(avail_val)) / Decimal("1e18")
                     break
         except Exception as e:
             logger.debug(f"[{self.pair}] Gagal memperbarui saldo: {e}")
@@ -85,36 +85,76 @@ class PairGridWorker:
 
         client = await client_manager.get_client()
         try:
-            resp = await client.orders.list_open(symbol=self.pair)
+            resp = await client.orders.list_open()
+            pair_symbol_id = None
+            base_scale = 6
+            if client.catalogs and client.catalogs.spot_config:
+                for p in client.catalogs.spot_config.get("pairs", []):
+                    if p.get("symbol") == self.pair:
+                        pair_symbol_id = p.get("symbolId") or p.get("symbol_id")
+                        base_scale = p.get("baseQuantityScale") or p.get("base_quantity_scale", 6)
+                        break
+
             orders: List[dict] = []
             for o in resp.orders:
-                orders.append({
-                    "order_id": str(getattr(o, "order_id", "")),
-                    "client_order_id": str(getattr(o, "client_order_id", "")),
-                    "side": str(getattr(o, "side", "")).lower(),
-                    "price": Decimal(str(getattr(o, "price", "0"))),
-                    "qty": Decimal(str(getattr(o, "qty", "0"))),
-                })
+                matches_symbol = (pair_symbol_id is not None and getattr(o, "symbol_id", None) == pair_symbol_id)
+                client_id = str(getattr(o, "client_order_id", ""))
+                matches_prefix = client_id.startswith(f"pg-{self.pair.lower()}-")
+
+                if matches_symbol or matches_prefix:
+                    px = Decimal("0.0")
+                    price_obj = getattr(o, "price", None)
+                    if price_obj is not None and hasattr(price_obj, "ticks"):
+                        px = Decimal(str(price_obj.ticks)) / Decimal("1e9")
+
+                    qty = Decimal("0.0")
+                    leaves_obj = getattr(o, "leaves_qty", getattr(o, "orig_qty", None))
+                    if leaves_obj is not None and hasattr(leaves_obj, "scaled"):
+                        qty = Decimal(str(leaves_obj.scaled)) / Decimal(10 ** base_scale)
+
+                    orders.append({
+                        "order_id": str(getattr(o, "order_id", "")),
+                        "client_order_id": client_id,
+                        "side": str(getattr(o, "side", "")).lower(),
+                        "price": px,
+                        "qty": qty,
+                    })
+
+            self.active_orders = {
+                (o["client_order_id"] or o["order_id"]): o for o in orders
+            }
             return orders
         except Exception as e:
             logger.debug(f"[{self.pair}] Error list open orders: {e}")
-            return []
+            return list(self.active_orders.values())
 
     async def cancel_order(self, order_id: str = "", client_order_id: str = "") -> None:
-        """Cancel an open order."""
+        """Cancel an open order with retry on transient network errors."""
         if config.dry_run:
             self.active_orders.pop(client_order_id, None)
             return
 
         client = await client_manager.get_client()
-        try:
-            from polyester.models.order_key import OrderId, ClientOrderId
-            if order_id:
-                await client.orders.cancel(key=OrderId(order_id), symbol=self.pair)
-            elif client_order_id:
-                await client.orders.cancel(key=ClientOrderId(client_order_id), symbol=self.pair)
-        except Exception as e:
-            logger.debug(f"[{self.pair}] Gagal membatalkan order {client_order_id or order_id}: {e}")
+        for attempt in range(3):
+            try:
+                from polyester.models.order_key import OrderId, ClientOrderId
+                if order_id:
+                    await client.orders.cancel(key=OrderId(order_id), symbol=self.pair)
+                elif client_order_id:
+                    await client.orders.cancel(key=ClientOrderId(client_order_id), symbol=self.pair)
+                break
+            except Exception as e:
+                err_str = str(e)
+                if "unavailable" in err_str.lower() and attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                    continue
+                logger.debug(f"[{self.pair}] Gagal membatalkan order {client_order_id or order_id}: {e}")
+                break
+            finally:
+                if client_order_id:
+                    self.active_orders.pop(client_order_id, None)
+                if order_id:
+                    self.active_orders.pop(order_id, None)
 
     async def place_order(
         self,
@@ -123,7 +163,7 @@ class PairGridWorker:
         qty: Decimal,
         level: int,
     ) -> Optional[dict]:
-        """Place a limit Post-Only order aligned with pair tick and step size."""
+        """Place a limit Post-Only order aligned with pair tick and step size with retry."""
         from decimal import ROUND_DOWN, ROUND_UP
         from polyester import Price
 
@@ -151,53 +191,56 @@ class PairGridWorker:
                 "time": time.time(),
             }
             self.active_orders[client_order_id] = order_info
-
-            # Simulate occasional trade execution in dry run
-            if len(self.active_orders) > config.grid_levels * 2:
-                oldest_key = next(iter(self.active_orders))
-                filled = self.active_orders.pop(oldest_key)
-                await telemetry.record_fill(
-                    pair=self.pair,
-                    side=filled["side"],
-                    price=filled["price"],
-                    qty=filled["qty"],
-                    order_id=filled["order_id"],
-                    client_order_id=filled["client_order_id"],
-                    realized_pnl=Decimal("0.05") * filled["price"] * filled["qty"],
-                )
             return order_info
 
         client = await client_manager.get_client()
-        try:
-            res = await client.orders.create(
-                symbol=self.pair,
-                side=side,
-                order_type="limit",
-                tif="gtc",
-                qty=qty_str,
-                price=price_obj,
-                post_only=True,
-                client_order_id=client_order_id,
-            )
-            order_info = {
-                "order_id": getattr(res, "order_id", ""),
-                "client_order_id": client_order_id,
-                "side": side,
-                "price": aligned_price,
-                "qty": aligned_qty,
-                "time": time.time(),
-            }
-            self.active_orders[client_order_id] = order_info
-            self.last_error = ""
-            return order_info
-        except Exception as e:
-            err_str = str(e)
-            if "does not allow spot trading" in err_str.lower() or "policy" in err_str.lower():
-                self.last_error = "Izin 'Spot Trading' belum diaktifkan pada API Key di dashboard!"
-            else:
-                self.last_error = err_str[:45]
-            logger.warning(f"[{self.pair}] Gagal memasang order {side.upper()} {qty_str}@{aligned_price}: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                res = await client.orders.create(
+                    symbol=self.pair,
+                    side=side,
+                    order_type="limit",
+                    tif="gtc",
+                    qty=qty_str,
+                    price=price_obj,
+                    post_only=True,
+                    client_order_id=client_order_id,
+                )
+                order_info = {
+                    "order_id": getattr(res, "order_id", ""),
+                    "client_order_id": client_order_id,
+                    "side": side,
+                    "price": aligned_price,
+                    "qty": aligned_qty,
+                    "time": time.time(),
+                }
+                self.active_orders[client_order_id] = order_info
+                self.last_error = ""
+                return order_info
+            except Exception as e:
+                err_str = str(e)
+                if "duplicate" in err_str.lower():
+                    # Order was already successfully accepted by the exchange
+                    order_info = {
+                        "order_id": "",
+                        "client_order_id": client_order_id,
+                        "side": side,
+                        "price": aligned_price,
+                        "qty": aligned_qty,
+                        "time": time.time(),
+                    }
+                    self.active_orders[client_order_id] = order_info
+                    self.last_error = ""
+                    return order_info
+                if "unavailable" in err_str.lower() and attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                    continue
+                if "does not allow spot trading" in err_str.lower() or "policy" in err_str.lower():
+                    self.last_error = "Izin 'Spot Trading' belum diaktifkan pada API Key di dashboard!"
+                else:
+                    self.last_error = err_str[:45]
+                logger.warning(f"[{self.pair}] Gagal memasang order {side.upper()} {qty_str}@{aligned_price}: {e}")
+                return None
 
     async def reconcile_grid(self) -> None:
         """Core cycle: evaluate orderbook, calculate risk/skew, and align grid orders."""
@@ -223,7 +266,90 @@ class PairGridWorker:
         # 2. Update held balances
         await self.update_balances()
 
-        # 3. Calculate dynamic risk & skewing
+        # Route to appropriate strategy
+        if config.strategy_mode == "QUICK_CHURN":
+            await self.reconcile_quick_churn(ob)
+        else:
+            await self.reconcile_grid_passive(ob)
+
+    async def reconcile_quick_churn(self, ob: OrderBookSnapshot) -> None:
+        """Fast turnover mode: 1-tick two-sided quoting with auto-repegging and asymmetric offload."""
+        params = risk_engine.calculate_quick_churn_params(
+            pair=self.pair,
+            best_bid=ob.best_bid,
+            best_ask=ob.best_ask,
+            mid_price=ob.mid_price,
+            held_base_qty=self.held_base_qty,
+        )
+
+        self.circuit_broken = params.circuit_broken
+
+        # Circuit breaker safety
+        if params.circuit_broken:
+            self.status_message = f"CIRCUIT BREAKER: {params.circuit_reason}"
+            open_orders = await self.fetch_open_orders()
+            for o in open_orders:
+                await self.cancel_order(o["order_id"], o["client_order_id"])
+            self.active_orders.clear()
+            return
+
+        current_open = await self.fetch_open_orders()
+        buy_orders = [o for o in current_open if o["side"] == "buy"]
+        sell_orders = [o for o in current_open if o["side"] == "sell"]
+
+        # Cancel any extra resting orders so there is at most 1 buy and 1 sell
+        while len(buy_orders) > 1:
+            extra = buy_orders.pop()
+            await self.cancel_order(extra["order_id"], extra["client_order_id"])
+
+        while len(sell_orders) > 1:
+            extra = sell_orders.pop()
+            await self.cancel_order(extra["order_id"], extra["client_order_id"])
+
+        target_buy_px = ob.best_bid
+        target_sell_px = ob.best_ask
+        repeg_threshold = self.tick_size * Decimal(str(config.repeg_tolerance_ticks))
+
+        # 1. Manage BUY order (Pegged at Best Bid)
+        if buy_orders:
+            curr_buy = buy_orders[0]
+            # Cancel if price drifted from Best Bid or if buying paused (inventory full)
+            if not params.allow_buy or abs(curr_buy["price"] - target_buy_px) >= repeg_threshold:
+                await self.cancel_order(curr_buy["order_id"], curr_buy["client_order_id"])
+                buy_orders.clear()
+
+        if not buy_orders and params.allow_buy and target_buy_px > 0:
+            qty = params.buy_order_size_usd / target_buy_px
+            new_buy = await self.place_order(side="buy", price=target_buy_px, qty=qty, level=1)
+            if new_buy:
+                buy_orders.append(new_buy)
+
+        # 2. Manage SELL order (Pegged at Best Ask)
+        if sell_orders:
+            curr_sell = sell_orders[0]
+            # Cancel if price drifted from Best Ask or if selling not allowed (no inventory)
+            if not params.allow_sell or abs(curr_sell["price"] - target_sell_px) >= repeg_threshold:
+                await self.cancel_order(curr_sell["order_id"], curr_sell["client_order_id"])
+                sell_orders.clear()
+
+        if not sell_orders and params.allow_sell and target_sell_px > 0:
+            desired_qty = params.sell_order_size_usd / target_sell_px
+            qty = min(desired_qty, self.held_base_qty)
+            if qty > 0:
+                new_sell = await self.place_order(side="sell", price=target_sell_px, qty=qty, level=1)
+                if new_sell:
+                    sell_orders.append(new_sell)
+
+        buys_count = len(buy_orders)
+        sells_count = len(sell_orders)
+        if buys_count == 0 and sells_count == 0 and self.last_error:
+            self.status_message = f"Gagal: {self.last_error}"
+        else:
+            self.status_message = f"Quick Churn ({buys_count}B/{sells_count}S) | {params.circuit_reason}"
+
+    async def reconcile_grid_passive(self, ob: OrderBookSnapshot) -> None:
+        """Classic passive multi-tier grid strategy."""
+        # Calculate dynamic risk & skewing
         grid_params = risk_engine.calculate_grid_params(
             pair=self.pair,
             best_bid=ob.best_bid,
@@ -289,7 +415,9 @@ class PairGridWorker:
             for px, qty, lvl in desired_sells:
                 has_near = any(abs(o["price"] - px) / px < Decimal("0.0015") for o in sell_orders)
                 if not has_near:
-                    await self.place_order(side="sell", price=px, qty=qty, level=lvl)
+                    sell_qty = min(qty, self.held_base_qty)
+                    if sell_qty > 0:
+                        await self.place_order(side="sell", price=px, qty=sell_qty, level=lvl)
                     break
 
         buys_count = len([o for o in self.active_orders.values() if o["side"] == "buy"])

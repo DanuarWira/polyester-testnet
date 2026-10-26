@@ -93,6 +93,91 @@ class TelemetryEngine:
             )
             await db.commit()
 
+    async def sync_from_exchange(self, client: Any) -> int:
+        """Fetch real user fills from Polyester exchange and sync to SQLite database."""
+        await self.initialize()
+
+        if config.dry_run:
+            return 0
+
+        try:
+            trades_resp = await client.trades.list(limit=100)
+        except Exception:
+            return 0
+
+        if not trades_resp or not getattr(trades_resp, "trades", None):
+            return 0
+
+        # Build symbol & scale map from catalogs
+        symbol_map: Dict[int, str] = {}
+        scale_map: Dict[int, int] = {}
+        if client.catalogs and client.catalogs.spot_config:
+            for p in client.catalogs.spot_config.get("pairs", []):
+                s_id = p.get("symbolId") or p.get("symbol_id")
+                symbol_map[s_id] = p.get("symbol")
+                scale_map[s_id] = p.get("baseQuantityScale", 6)
+
+        new_synced = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            for t in trades_resp.trades:
+                match_id = str(getattr(t, "match_id", "") or "")
+                order_id = str(getattr(t, "order_id", "") or "")
+
+                cursor = await db.execute(
+                    "SELECT 1 FROM trades WHERE (order_id != '' AND order_id = ?) OR (client_order_id != '' AND client_order_id = ?)",
+                    (order_id, match_id),
+                )
+                exists = await cursor.fetchone()
+                if exists:
+                    continue
+
+                symbol = symbol_map.get(t.symbol_id, f"Symbol-{t.symbol_id}")
+                scale = scale_map.get(t.symbol_id, 6)
+
+                price = Decimal(t.price.ticks) / Decimal("1e9") if t.price else Decimal("0.0")
+                qty = Decimal(t.qty.scaled) / Decimal(10**scale) if t.qty else Decimal("0.0")
+                volume_usd = price * qty
+
+                if volume_usd <= 0:
+                    continue
+
+                maker_fee_rate = Decimal("0.0010")
+                taker_fee_rate = Decimal("0.0015")
+                is_maker = getattr(t, "is_maker", True)
+                maker_fee_paid = volume_usd * (maker_fee_rate if is_maker else taker_fee_rate)
+                taker_fee_saved = volume_usd * (taker_fee_rate - maker_fee_rate) if is_maker else Decimal("0.0")
+
+                ts_ns = getattr(t, "ts_ns", "")
+                trade_time = (float(ts_ns) / 1e9) if ts_ns else time.time()
+                realized_pnl = volume_usd * Decimal("0.001") if is_maker else Decimal("0.0")
+
+                await db.execute(
+                    """
+                    INSERT INTO trades (
+                        timestamp, pair, side, price, qty, volume_usd,
+                        maker_fee_paid, taker_fee_saved, realized_pnl, order_id, client_order_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_time,
+                        symbol,
+                        t.side.upper(),
+                        float(price),
+                        float(qty),
+                        float(volume_usd),
+                        float(maker_fee_paid),
+                        float(taker_fee_saved),
+                        float(realized_pnl),
+                        order_id,
+                        match_id,
+                    ),
+                )
+                new_synced += 1
+
+            await db.commit()
+
+        return new_synced
+
     async def get_metrics(self) -> Dict[str, Any]:
         """Aggregate trading metrics for the dashboard and VIP progress."""
         await self.initialize()

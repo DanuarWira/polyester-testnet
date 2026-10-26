@@ -24,6 +24,11 @@ class BotConfig:
         self.api_url: str = os.getenv("POLYESTER_API_URL", "https://api.testnet.polyester.com").strip()
         self.ws_url: str = os.getenv("POLYESTER_WS_URL", "wss://api.testnet.polyester.com").strip()
 
+        # Strategy Mode: QUICK_CHURN (Aggressive Tight Maker) or GRID_PASSIVE (Passive Grid)
+        self.strategy_mode: str = os.getenv("STRATEGY_MODE", "QUICK_CHURN").strip().upper()
+        if self.strategy_mode not in ("QUICK_CHURN", "GRID_PASSIVE"):
+            self.strategy_mode = "QUICK_CHURN"
+
         # Multi-pair settings
         raw_pairs = os.getenv("TRADING_PAIRS", "BTC-USDT,ETH-USDT,BNB-USDT")
         self.trading_pairs: List[str] = [p.strip().upper() for p in raw_pairs.split(",") if p.strip()]
@@ -31,12 +36,15 @@ class BotConfig:
         # Grid settings
         self.grid_levels: int = int(os.getenv("GRID_LEVELS", "3"))
         self.grid_spread_pct: Decimal = Decimal(str(os.getenv("GRID_SPREAD_PCT", "0.0025")))
-        self.order_size_usdt: Decimal = Decimal(str(os.getenv("ORDER_SIZE_USDT", "50.0")))
+        default_order_size = "100.0" if self.strategy_mode == "QUICK_CHURN" else "50.0"
+        self.order_size_usdt: Decimal = Decimal(str(os.getenv("ORDER_SIZE_USDT", default_order_size)))
 
         # Risk and Inventory settings
         self.max_inventory_usd_per_pair: Decimal = Decimal(str(os.getenv("MAX_INVENTORY_USD_PER_PAIR", "300.0")))
         self.circuit_breaker_spread_pct: Decimal = Decimal(str(os.getenv("CIRCUIT_BREAKER_SPREAD_PCT", "0.015")))
-        self.update_interval_seconds: float = float(os.getenv("UPDATE_INTERVAL_SECONDS", "3.0"))
+        default_interval = "1.0" if self.strategy_mode == "QUICK_CHURN" else "3.0"
+        self.update_interval_seconds: float = float(os.getenv("UPDATE_INTERVAL_SECONDS", default_interval))
+        self.repeg_tolerance_ticks: int = int(os.getenv("REPEG_TOLERANCE_TICKS", "1"))
 
         # VIP Tracker settings
         self.target_30d_volume_usd: Decimal = Decimal(str(os.getenv("TARGET_30D_VOLUME_USD", "100000.0")))

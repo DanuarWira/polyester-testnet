@@ -46,9 +46,11 @@ class BotDashboard:
         # 1. Header Panel
         mode_text = "[bold yellow]DRY-RUN (SIMULATION)[/bold yellow]" if config.dry_run else "[bold green]LIVE TESTNET[/bold green]"
         acc_id = config.account_id if config.account_id else "Not Set"
+        strategy_badge = f"[bold magenta]{config.strategy_mode}[/bold magenta]"
         header_text = Text.assemble(
             (">> POLYESTER VIP VOLUME FARMING BOT <<\n", "bold cyan"),
             ("Environment: ", "dim"), (mode_text), (" | Account: ", "dim"), (f"{acc_id}", "bold white"),
+            (" | Strategy: ", "dim"), (strategy_badge),
             (" | Pairs: ", "dim"), (f"{', '.join(config.trading_pairs)}", "yellow"),
         )
         layout["header"].update(Panel(Align.center(header_text), style="cyan", border_style="bright_blue"))
@@ -97,8 +99,9 @@ class BotDashboard:
                 Text(worker.status_message, style=status_style),
             )
 
+        table_title = f"[bold cyan][Strategy: {config.strategy_mode}] Multi-Pair Order State[/bold cyan]"
         layout["pairs_table"].update(
-            Panel(pairs_table, title="[bold cyan][Grid] Multi-Pair Grid State[/bold cyan]", border_style="cyan")
+            Panel(pairs_table, title=table_title, border_style="cyan")
         )
 
         # 4. Financial & Fee Optimization Panel

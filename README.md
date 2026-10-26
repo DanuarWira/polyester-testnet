@@ -6,28 +6,32 @@ Bot trading multi-pair otomatis berperforma tinggi di **Polyester Testnet** yang
 
 ## 🌟 Fitur Utama
 
-1. **Zero-Taker Fee Policy (Post-Only Enforced)**:
+1. **Dual Strategy Mode (Pilihan Strategi Fleksibel)**:
+   * **`QUICK_CHURN` (Mode Cepat - Default)**: Menempatkan order *Post-Only Maker* tepat di antrean terdepan (**Best Bid & Best Ask**) dengan auto-repeg 1 detik dan *Asymmetric Aggressive Offloading* agar koin langsung cepat dijual kembali ke USDT, memaksimalkan kecepatan akumulasi volume $100K VIP 1.
+   * **`GRID_PASSIVE` (Mode Pasif)**: Strategi grid bertingkat klasik (*multi-tier*) untuk pasar yang sedang bergerak *ranging/sideways* lebar.
+
+2. **Zero-Taker Fee Policy (Post-Only Enforced)**:
    - Setiap order limit beli dan jual dipasang dengan flag `post_only=True`.
    - Memastikan akun Anda selalu menjadi **Maker** (fee terendah 0.10% di VIP 0, turun hingga 0.08% di VIP 1, serta potensi rebate).
    - Terbebas dari potongan Taker fee sebesar 0.15%.
 
-2. **Capturing Bid-Ask Spread (Profit Generation)**:
+3. **Capturing Bid-Ask Spread (Profit Generation)**:
    - Mengambil keuntungan mikro dari selisih spread harga antara order beli dan jual secara berulang, sehingga volume trading yang besar justru memupuk profit dan melindungi saldo dari depresiasi fee.
 
-3. **Multi-Pair Parallel Workers**:
-   - Menjalankan loop perdagangan konkuren berbasis Python `asyncio` untuk pasangan spot likuid: `BTC-USDT`, `ETH-USDT`, `BNB-USDT` (dapat dikonfigurasi).
+4. **Multi-Pair Parallel Workers**:
+   - Menjalankan loop perdagangan konkuren berbasis Python `asyncio` untuk pasangan spot likuid: `BTC-USDT`, `ETH-USDT` (dapat dikonfigurasi).
 
-4. **Dynamic Inventory Skewing & Circuit Breaker**:
+5. **Dynamic Inventory Skewing & Circuit Breaker**:
    - Jika pasar bergerak satu arah dan koin menumpuk, bot otomatis menggeser harga jual lebih dekat ke mid-price untuk segera melepas koin (*rebalance*) dan mengerem pembelian.
    - Dilengkapi *Circuit Breaker*: otomatis membatalkan seluruh order jika spread pasar melebar di atas batas aman (default: 1.5%) atau terjadi lonjakan volatilitas ekstrem.
 
-5. **Live Interactive Terminal UI Dashboard (Rich TUI)**:
+6. **Live Interactive Terminal UI Dashboard (Rich TUI)**:
    - Progress bar akumulasi volume 30-hari menuju target kasta VIP 1 ($100,000 USD).
-   - Tabel status grid per-pair secara real-time.
+   - Tabel status grid per-pair secara real-time dengan status repeg antrean.
    - Ringkasan keuntungan (*Realized PnL*), biaya fee yang dibayar, dan estimasi Taker fee yang berhasil dihemat.
    - Log aktivitas transaksi terkini.
 
-6. **Safety & Graceful Shutdown**:
+7. **Safety & Graceful Shutdown**:
    - Saat Anda menekan `Ctrl + C`, bot secara otomatis membatalkan semua open order di Polyester Testnet sebelum mematikan koneksi.
 
 ---
