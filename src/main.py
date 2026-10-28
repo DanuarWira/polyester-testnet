@@ -131,19 +131,22 @@ class PolyesterBotOrchestrator:
         console.print("\n[bold yellow]Sedang mematikan bot secara aman (Graceful Shutdown)...[/bold yellow]")
         self.is_running = False
 
-        # Stop workers
+        # 1. Stop workers
         for worker in self.workers.values():
             worker.stop()
 
-        # Cancel open orders on testnet
+        # Allow workers brief time to finish order cancellations
+        await asyncio.sleep(0.5)
+
+        # 2. Cancel any remaining open orders on testnet
         await client_manager.cancel_all_open_orders(list(self.workers.keys()))
 
-        # Await worker task cancellations
+        # 3. Cancel and await worker background tasks
         for task in self.worker_tasks:
             task.cancel()
         await asyncio.gather(*self.worker_tasks, return_exceptions=True)
 
-        # Close client connections
+        # 4. Close client connections
         await client_manager.close()
         console.print("[bold green][OK] Seluruh open order dibatalkan & koneksi ditutup dengan aman. Sampai jumpa![/bold green]\n")
 

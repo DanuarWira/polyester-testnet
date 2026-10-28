@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from polyester import (
     POLYESTER_TESTNET_ENVIRONMENT,
@@ -23,6 +24,7 @@ class PolyesterClientManager:
     def __init__(self) -> None:
         self._client: Optional[AsyncPolyester] = None
         self._is_connected = False
+        self.shared_available_usdt: Decimal = Decimal("0.0")
 
     async def get_client(self) -> AsyncPolyester:
         """Get or initialize the AsyncPolyester client instance."""
@@ -141,18 +143,48 @@ class PolyesterClientManager:
         return results
 
     async def cancel_all_open_orders(self, pairs: List[str]) -> None:
-        """Emergency or shutdown action: Cancel all active open orders."""
+        """Emergency or shutdown action: Cancel all active open orders individually."""
         if config.dry_run:
             logger.info("[DRY-RUN] Simulasi pembatalan seluruh order terbuka.")
             return
 
         client = await self.get_client()
-        for pair in pairs:
-            try:
-                logger.info(f"Membatalkan seluruh order terbuka pada pair {pair}...")
-                await client.orders.cancel_all(symbol=pair)
-            except Exception as e:
-                logger.warning(f"Gagal membatalkan order untuk {pair}: {e}")
+        try:
+            from polyester.models.order_key import OrderId
+            resp = await client.orders.list_open()
+            open_count = len(resp.orders)
+            if open_count == 0:
+                logger.info("Tidak ada order terbuka yang perlu dibatalkan.")
+                return
+
+            logger.info(f"Membatalkan {open_count} order terbuka di seluruh pair...")
+            symbol_map = {}
+            if client.catalogs and client.catalogs.spot_config:
+                for p in client.catalogs.spot_config.get("pairs", []):
+                    s_id = p.get("symbolId") or p.get("symbol_id")
+                    symbol_map[s_id] = p.get("symbol")
+
+            for o in resp.orders:
+                order_id = getattr(o, "order_id", "")
+                sym = symbol_map.get(getattr(o, "symbol_id", None))
+                if not sym:
+                    cid = getattr(o, "client_order_id", "").lower()
+                    for pair in pairs:
+                        if pair.lower() in cid:
+                            sym = pair
+                            break
+
+                for attempt in range(3):
+                    try:
+                        await client.orders.cancel(key=OrderId(order_id), symbol=sym)
+                        logger.debug(f"Order {order_id} ({sym}) berhasil dibatalkan.")
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            logger.warning(f"Gagal membatalkan order {order_id}: {e}")
+                        await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Gagal memproses pembatalan seluruh order: {e}")
 
     async def close(self) -> None:
         """Close client sessions and connections."""

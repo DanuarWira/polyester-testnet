@@ -28,12 +28,16 @@ class PairGridWorker:
         self.is_running = False
         self.active_orders: Dict[str, dict] = {}
         self.held_base_qty: Decimal = Decimal("0.0")
+        self.available_quote_qty: Decimal = Decimal("0.0")
         self.last_mid_price: Decimal = Decimal("0.0")
         self.status_message: str = "Inisialisasi..."
         self.circuit_broken: bool = False
         self.last_error: str = ""
+        self.cooldown_until: float = 0.0
         self.tick_size: Decimal = Decimal("0.01")
         self.step_size: Decimal = Decimal("0.000001")
+        self.min_notional: Decimal = Decimal("5.0")
+        self.min_qty: Decimal = Decimal("0.000001")
 
     def _format_price(self, price: Decimal) -> str:
         """Format price string based on symbol magnitude."""
@@ -54,7 +58,7 @@ class PairGridWorker:
             return f"{qty:.2f}"
 
     async def update_balances(self) -> None:
-        """Fetch current held base asset balance."""
+        """Fetch current held base and quote available balances."""
         if config.dry_run:
             return
 
@@ -69,12 +73,18 @@ class PairGridWorker:
             bal_list = getattr(balances, "balances", getattr(balances, "items", []))
             for b in bal_list:
                 asset_name = getattr(b, "asset", None) or asset_map.get(getattr(b, "asset_id", None))
-                if asset_name and asset_name.upper() == self.base_asset:
-                    # Use available (unlocked) trading balance to prevent Insufficient Funds
-                    avail_val = getattr(b, "available", getattr(b, "trading", "0"))
-                    if avail_val is not None:
-                        self.held_base_qty = Decimal(str(avail_val)) / Decimal("1e18")
-                    break
+                if not asset_name:
+                    continue
+                asset_name_upper = asset_name.upper()
+                avail_val = getattr(b, "available", getattr(b, "trading", "0"))
+                if avail_val is not None:
+                    parsed_val = Decimal(str(avail_val)) / Decimal("1e18")
+                    if asset_name_upper == self.base_asset:
+                        self.held_base_qty = parsed_val
+                    elif asset_name_upper == self.quote_asset:
+                        self.available_quote_qty = parsed_val
+                        if self.quote_asset == "USDT":
+                            client_manager.shared_available_usdt = parsed_val
         except Exception as e:
             logger.debug(f"[{self.pair}] Gagal memperbarui saldo: {e}")
 
@@ -164,6 +174,9 @@ class PairGridWorker:
         level: int,
     ) -> Optional[dict]:
         """Place a limit Post-Only order aligned with pair tick and step size with retry."""
+        if time.time() < self.cooldown_until:
+            return None
+
         from decimal import ROUND_DOWN, ROUND_UP
         from polyester import Price
 
@@ -176,6 +189,12 @@ class PairGridWorker:
         qty_str = f"{aligned_qty:.8f}".rstrip("0").rstrip(".")
 
         if aligned_qty <= 0 or aligned_price <= 0:
+            return None
+
+        # Min notional and min qty validation
+        notional = aligned_qty * aligned_price
+        if notional < self.min_notional or aligned_qty < self.min_qty:
+            logger.debug(f"[{self.pair}] Order {side.upper()} dibatalkan: notional ${notional:.2f} < ${self.min_notional} atau qty {aligned_qty} < {self.min_qty}")
             return None
 
         client_order_id = f"pg-{self.pair.lower()}-{side[0]}-{level}-{uuid.uuid4().hex[:6]}"
@@ -216,6 +235,8 @@ class PairGridWorker:
                 }
                 self.active_orders[client_order_id] = order_info
                 self.last_error = ""
+                if side == "buy" and self.quote_asset == "USDT":
+                    client_manager.shared_available_usdt = max(Decimal("0.0"), client_manager.shared_available_usdt - notional)
                 return order_info
             except Exception as e:
                 err_str = str(e)
@@ -232,6 +253,13 @@ class PairGridWorker:
                     self.active_orders[client_order_id] = order_info
                     self.last_error = ""
                     return order_info
+                if "insufficient funds" in err_str.lower():
+                    # Set 5-second cooldown and trigger balance update
+                    self.cooldown_until = time.time() + 5.0
+                    self.last_error = "Saldo tidak cukup, cooldown 5s"
+                    asyncio.create_task(self.update_balances())
+                    logger.info(f"[{self.pair}] Insufficient funds, aktifkan cooldown 5s: {side.upper()} {qty_str}@{aligned_price}")
+                    return None
                 if "unavailable" in err_str.lower() and attempt < 2:
                     await asyncio.sleep(0.4 * (attempt + 1))
                     continue
@@ -252,7 +280,7 @@ class PairGridWorker:
 
         self.last_mid_price = ob.mid_price
 
-        # Update tick and step size from catalogs if available
+        # Update tick and step size, min notional, min qty from catalogs if available
         client = await client_manager.get_client()
         if client.catalogs and client.catalogs.spot_config:
             for p in client.catalogs.spot_config.get("pairs", []):
@@ -261,6 +289,10 @@ class PairGridWorker:
                         self.tick_size = Decimal(str(p["tickSize"]))
                     if p.get("stepSize"):
                         self.step_size = Decimal(str(p["stepSize"]))
+                    if p.get("minNotionalQuote"):
+                        self.min_notional = Decimal(str(p["minNotionalQuote"]))
+                    if p.get("minQtyBase"):
+                        self.min_qty = Decimal(str(p["minQtyBase"]))
                     break
 
         # 2. Update held balances
@@ -274,12 +306,21 @@ class PairGridWorker:
 
     async def reconcile_quick_churn(self, ob: OrderBookSnapshot) -> None:
         """Fast turnover mode: 1-tick two-sided quoting with auto-repegging and asymmetric offload."""
+        # Check if worker is in cooldown due to insufficient funds or transient errors
+        if time.time() < self.cooldown_until:
+            rem = int(self.cooldown_until - time.time())
+            self.status_message = f"Cooldown ({rem}s) | {self.last_error}"
+            return
+
+        current_quote_avail = client_manager.shared_available_usdt if self.quote_asset == "USDT" else self.available_quote_qty
         params = risk_engine.calculate_quick_churn_params(
             pair=self.pair,
             best_bid=ob.best_bid,
             best_ask=ob.best_ask,
             mid_price=ob.mid_price,
             held_base_qty=self.held_base_qty,
+            available_quote_usd=current_quote_avail,
+            min_notional_usd=self.min_notional,
         )
 
         self.circuit_broken = params.circuit_broken
@@ -320,9 +361,10 @@ class PairGridWorker:
 
         if not buy_orders and params.allow_buy and target_buy_px > 0:
             qty = params.buy_order_size_usd / target_buy_px
-            new_buy = await self.place_order(side="buy", price=target_buy_px, qty=qty, level=1)
-            if new_buy:
-                buy_orders.append(new_buy)
+            if qty >= self.min_qty and (qty * target_buy_px) >= self.min_notional:
+                new_buy = await self.place_order(side="buy", price=target_buy_px, qty=qty, level=1)
+                if new_buy:
+                    buy_orders.append(new_buy)
 
         # 2. Manage SELL order (Pegged at Best Ask)
         if sell_orders:
@@ -334,8 +376,10 @@ class PairGridWorker:
 
         if not sell_orders and params.allow_sell and target_sell_px > 0:
             desired_qty = params.sell_order_size_usd / target_sell_px
-            qty = min(desired_qty, self.held_base_qty)
-            if qty > 0:
+            # Apply safety multiplier 0.999 (0.1% buffer) so fee rounding does not exceed available balance
+            safe_qty = self.held_base_qty * Decimal("0.999")
+            qty = min(desired_qty, safe_qty)
+            if qty >= self.min_qty and (qty * target_sell_px) >= self.min_notional:
                 new_sell = await self.place_order(side="sell", price=target_sell_px, qty=qty, level=1)
                 if new_sell:
                     sell_orders.append(new_sell)
@@ -441,7 +485,9 @@ class PairGridWorker:
                 logger.error(f"[{self.pair}] Error pada siklus grid: {e}")
                 self.status_message = f"Error: {e}"
 
-            await asyncio.sleep(config.update_interval_seconds)
+            import random
+            jitter = random.uniform(0.05, 0.25)
+            await asyncio.sleep(config.update_interval_seconds + jitter)
 
         # Cleanup on stop
         logger.info(f"[{self.pair}] Menghentikan worker...")

@@ -130,7 +130,7 @@ class RiskEngine:
 
         # Hard inventory limits
         allow_buy = base_value_usd < self.max_inventory_usd
-        allow_sell = held_base_qty > Decimal("0.0001")
+        allow_sell = base_value_usd >= Decimal("5.0")
 
         reason = "" if allow_buy else f"Batas inventaris tercapai ({base_value_usd:.2f} USD >= {self.max_inventory_usd:.2f} USD)"
 
@@ -152,6 +152,8 @@ class RiskEngine:
         best_ask: Decimal,
         mid_price: Decimal,
         held_base_qty: Decimal,
+        available_quote_usd: Decimal = Decimal("999999"),
+        min_notional_usd: Decimal = Decimal("5.0"),
     ) -> GridParameters:
         """Calculate tight-maker parameters with asymmetric offloading for quick turnover."""
         self.record_price(pair, mid_price)
@@ -183,7 +185,7 @@ class RiskEngine:
             reason = f"Offloading Inventaris (${base_value_usd:.2f}) -> USDT"
             sell_size = min(base_value_usd, self.base_order_size * Decimal("1.5"))
             buy_size = Decimal("0.0")
-        elif base_value_usd >= Decimal("5.0"):
+        elif base_value_usd >= min_notional_usd:
             # Hold some base coin (above minimum $5 notional): allow two-sided quoting
             allow_buy = True
             allow_sell = True
@@ -191,7 +193,7 @@ class RiskEngine:
             sell_size = base_value_usd
             buy_size = self.base_order_size
         else:
-            # Low or no base coin: buy to initiate new round-trip
+            # Dust or no base coin: buy to initiate new round-trip, do NOT attempt dust sell
             allow_buy = True
             allow_sell = False
             reason = "Membuka Posisi Baru (Buy Best Bid)"
@@ -203,6 +205,16 @@ class RiskEngine:
             allow_buy = False
             allow_sell = True
             reason = f"Batas Inventaris Maksimal Tercapai (${base_value_usd:.2f})"
+
+        # Global Portfolio USDT Capital Guard
+        if allow_buy and available_quote_usd < buy_size * Decimal("1.02"):
+            if available_quote_usd >= Decimal("15.0"):
+                # Dynamically scale buy size to available USDT balance
+                buy_size = (available_quote_usd * Decimal("0.95")).quantize(Decimal("0.01"))
+                reason += f" | Skala Modal Dinamis (${buy_size:.2f})"
+            else:
+                allow_buy = False
+                reason = f"Menunggu Likuiditas USDT (${available_quote_usd:.2f} < ${min_notional_usd:.2f})"
 
         return GridParameters(
             allow_buy=allow_buy,
